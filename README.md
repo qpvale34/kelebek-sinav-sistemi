@@ -21,7 +21,9 @@
 - **Soru Bankası:** Sınavlar için soru bankası oluşturma ve yönetme.
 
 ---
-
+## ✨Otonom Özellikler
+- **Toplu yazdırma özelliği ile ,öğretmenlerimizden word dosyası eklinde alıp sisteme yüklediğimiz sınav dosyalarını , harmanlamış olduğu sınav oturma düzenlerini kaydettikten sonra , toplu yazdıma sayfasından kaydettiği klasörü seçip yazdır dediğimizde  şube şube hepsinin başına bir kapak sayfası bir yoklama listesi bir de oturma düzeni tablosu olacak şekilde yazıcıdan çıktı verir , çıktıları alıp sınıflara direk uygulayabilirsiniz.**
+- **Sınav günü öğrencileri bilgilendirmek için ilgili listeyi panoya asabilir , veya sınıflara gönderebilirsiniz ki sınav yerlerini öğrenip sınav saati ilgili şubeye gitsinler.** 
 ## 🚀 Kurulum
 
 ### Ön Gereksinimler
