@@ -1,4 +1,5 @@
 # 🦋 Kelebek Sınav Sistemi
+<img width="1914" height="980" alt="kelebek" src="https://github.com/user-attachments/assets/8ee3f765-f758-4a9a-b23b-b95a5bb820dc" />
 
 **Kelebek Sınav Sistemi**, okullar ve eğitim kurumları için tasarlanmış, öğrencilerin sınav salonlarına optimize edilmiş bir şekilde yerleştirilmesini sağlayan modern bir masaüstü uygulamasıdır. "Kelebek sistemi" mantığına dayanarak farklı sınıflardan öğrencileri aynı salonda karma bir şekilde oturtarak kopya riskini minimize eder ve sınav organizasyonunu kolaylaştırır.
 
