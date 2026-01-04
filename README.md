@@ -77,7 +77,7 @@
 
 ## 👨‍💻 Geliştirici
 
-- **İbrahim ERTUĞRUL** - *Geliştirici* - [qpvale34](https://github.com/qpvale34) - Teşekkürler [DUDULLU AMANETOĞLU İMAM HATİP LİSESİ Instagram](https://www.instagram.com/dudulluaihl/) - [DUDULLU AMANETOĞLU İMAM HATİP LİSESİ WEB] (https://dudulluaaihl.meb.k12.tr/)
+- **İbrahim ERTUĞRUL** - *Geliştirici* - [qpvale34](https://github.com/qpvale34) - Teşekkürler [DUDULLU AMANETOĞLU İMAM HATİP LİSESİ Instagram](https://www.instagram.com/dudulluaihl/) - [DUDULLU AMANETOĞLU İMAM HATİP LİSESİ WEB](https://dudulluaaihl.meb.k12.tr/)
 
 ---
 
