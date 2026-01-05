@@ -29,6 +29,12 @@ class OgrenciEkleView:
         self.excel_handler = ExcelHandler()
         setup_responsive_window(self.window)
         
+        # Pagination state
+        self._page_size = 50
+        self._current_offset = 0
+        self._total_count = 0
+        self._loading = False
+        
         self.setup_ui()
         self.load_ogrenciler()
     
@@ -229,9 +235,10 @@ class OgrenciEkleView:
             self.tree.heading(col, text=col)
             self.tree.column(col, width=width, anchor="center")
         
-        # Scrollbar
+        # Scrollbar with lazy loading binding
         scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.configure(yscrollcommand=self._on_scroll_update)
+        self._scrollbar = scrollbar
         
         self.tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
@@ -252,20 +259,50 @@ class OgrenciEkleView:
         configure_standard_button(btn_delete_all, "danger", "🗑️ Tümünü Sil")
         btn_delete_all.pack(side="right", padx=5)
     
-    def load_ogrenciler(self):
-        """Öğrencileri yükle"""
-        # Mevcut verileri temizle
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+    def _on_scroll_update(self, first, last):
+        """Scrollbar güncelleme callback'i - lazy loading tetikler"""
+        self._scrollbar.set(first, last)
+        # %90'dan fazla scroll edildiyse daha fazla yükle
+        if float(last) >= 0.9:
+            self._on_tree_scroll()
+    
+    def load_ogrenciler(self, append: bool = False):
+        """Öğrencileri yükle (lazy loading destekli)
         
-        # Filtre uygula (string tabanlı sınıf seviyeleri)
-        sinif_filter = None if self.filter_sinif.get() == "Tümü" else self.filter_sinif.get()
-        sube_filter = None if self.filter_sube.get() == "Tümü" else self.filter_sube.get()
+        Args:
+            append: True ise mevcut listeye ekle, False ise listeyi sıfırla
+        """
+        if self._loading:
+            return
+        
+        self._loading = True
         
         try:
-            ogrenciler = self.db.ogrencileri_listele(sinif=sinif_filter, sube=sube_filter)
+            # Filtre uygula (string tabanlı sınıf seviyeleri)
+            sinif_filter = None if self.filter_sinif.get() == "Tümü" else self.filter_sinif.get()
+            sube_filter = None if self.filter_sube.get() == "Tümü" else self.filter_sube.get()
             
-            for index, ogr in enumerate(ogrenciler, start=1):
+            if not append:
+                # Liste sıfırlanıyor
+                for item in self.tree.get_children():
+                    self.tree.delete(item)
+                self._current_offset = 0
+                self._total_count = self.db.ogrenci_sayisi(sinif=sinif_filter, sube=sube_filter)
+            
+            # Daha fazla veri var mı kontrol et
+            if self._current_offset >= self._total_count:
+                self._loading = False
+                return
+            
+            ogrenciler = self.db.ogrencileri_listele(
+                sinif=sinif_filter, 
+                sube=sube_filter,
+                limit=self._page_size,
+                offset=self._current_offset
+            )
+            
+            start_index = self._current_offset + 1
+            for index, ogr in enumerate(ogrenciler, start=start_index):
                 sabit = "✓ Sabit" if ogr['sabit_mi'] else ""
                 self.tree.insert("", "end", values=(
                     index,
@@ -276,8 +313,20 @@ class OgrenciEkleView:
                     ogr['sube'],
                     sabit
                 ))
+            
+            self._current_offset += len(ogrenciler)
+            
         except Exception as e:
             show_message(self.window, f"Yükleme hatası: {e}", "error")
+        finally:
+            self._loading = False
+    
+    def _on_tree_scroll(self, *args):
+        """Treeview scroll olayını yakala ve gerekirse daha fazla veri yükle"""
+        # Scrollbar pozisyonunu kontrol et
+        if self.tree.yview()[1] >= 0.9:  # %90'dan fazla scroll edildi
+            if self._current_offset < self._total_count:
+                self.load_ogrenciler(append=True)
     
     def add_ogrenci_manual(self):
         """Manuel öğrenci ekle"""

@@ -470,8 +470,18 @@ class DatabaseManager:
             return dict(row) if row else None
     
     def ogrencileri_listele(self, sinif: Optional[int] = None, sube: Optional[str] = None,
-                           sabit_mi: Optional[bool] = None, siniflar: Optional[List[int]] = None) -> List[Dict]:
-        """Öğrencileri filtreli listele - sinif-sube formatını da destekler"""
+                           sabit_mi: Optional[bool] = None, siniflar: Optional[List[int]] = None,
+                           limit: Optional[int] = None, offset: int = 0) -> List[Dict]:
+        """Öğrencileri filtreli listele - sinif-sube formatını da destekler
+        
+        Args:
+            sinif: Tek bir sınıf seviyesi filtresi
+            sube: Şube filtresi
+            sabit_mi: Sabit öğrenci filtresi
+            siniflar: Çoklu sınıf listesi (örn: ["5", "6-A", "10-B"])
+            limit: Döndürülecek maksimum kayıt sayısı (None = sınırsız)
+            offset: Atlanacak kayıt sayısı (pagination için)
+        """
         query = "SELECT * FROM ogrenciler WHERE aktif_mi = 1"
         params = []
         
@@ -521,10 +531,68 @@ class DatabaseManager:
         
         query += " ORDER BY sinif, sube, soyad, ad"
         
+        # Pagination
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.append(limit)
+            params.append(offset)
+        
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
+    
+    def ogrenci_sayisi(self, sinif: Optional[int] = None, sube: Optional[str] = None,
+                       sabit_mi: Optional[bool] = None, siniflar: Optional[List[int]] = None) -> int:
+        """Filtrelenmiş öğrenci sayısını döndür (pagination için toplam sayı)"""
+        query = "SELECT COUNT(*) as count FROM ogrenciler WHERE aktif_mi = 1"
+        params = []
+        
+        if sinif is not None:
+            query += " AND sinif = ?"
+            params.append(sinif)
+        
+        if siniflar is not None and len(siniflar) > 0:
+            sinif_sube_pairs = []
+            plain_siniflar = []
+            
+            for s in siniflar:
+                s_str = str(s)
+                if '-' in s_str:
+                    parts = s_str.rsplit('-', 1)
+                    if len(parts) == 2:
+                        sinif_sube_pairs.append((parts[0], parts[1]))
+                else:
+                    plain_siniflar.append(s_str)
+            
+            conditions = []
+            
+            if plain_siniflar:
+                placeholders = ','.join('?' * len(plain_siniflar))
+                conditions.append(f"sinif IN ({placeholders})")
+                params.extend(plain_siniflar)
+            
+            for sinif_val, sube_val in sinif_sube_pairs:
+                conditions.append("(sinif = ? AND sube = ?)")
+                params.append(sinif_val)
+                params.append(sube_val)
+            
+            if conditions:
+                query += " AND (" + " OR ".join(conditions) + ")"
+        
+        if sube is not None:
+            query += " AND sube = ?"
+            params.append(sube.strip())
+        
+        if sabit_mi is not None:
+            query += " AND sabit_mi = ?"
+            params.append(sabit_mi)
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            row = cursor.fetchone()
+            return row['count'] if row else 0
 
     def sinif_hiyerarsisi(self) -> List[SinifSeviye]:
         """Tüm öğrencileri sınıf/şube hiyerarşisine dönüştür."""

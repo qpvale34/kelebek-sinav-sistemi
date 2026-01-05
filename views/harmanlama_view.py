@@ -9,6 +9,7 @@ import sys
 import os
 import re
 import threading
+import queue
 from datetime import datetime
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -114,8 +115,14 @@ class GelismisHarmanlamaView:
         self.gozetmen_tree = None
         self.gozetmen_tree_map = {}
         
+        # Threading infrastructure
+        self._worker_queue: queue.Queue = queue.Queue()
+        self._worker_thread: threading.Thread | None = None
+        self._loading_dialog: LoadingDialog | None = None
+        
         self.setup_ui()
         self.load_sinavlar()
+        self._poll_worker_queue()
     
     def setup_ui(self):
         """UI oluştur"""
@@ -920,8 +927,38 @@ class GelismisHarmanlamaView:
             self.log_text.delete(1.0, tk.END)
             self.log_text.config(state="disabled")
     
+    def _poll_worker_queue(self):
+        """Poll the worker queue for messages from background threads."""
+        try:
+            while True:
+                msg_type, payload = self._worker_queue.get_nowait()
+                
+                if msg_type == "log":
+                    self.log(payload)
+                elif msg_type == "progress":
+                    if self._loading_dialog:
+                        self._loading_dialog.message_label.config(text=payload)
+                elif msg_type == "done":
+                    self._on_harmanla_done(payload)
+                elif msg_type == "error":
+                    self._on_harmanla_error(payload)
+                elif msg_type == "excel_done":
+                    self._on_excel_done(payload)
+                elif msg_type == "excel_error":
+                    self._on_excel_error(payload)
+        except queue.Empty:
+            pass
+        
+        # Schedule next poll if window still exists
+        if self.window.winfo_exists():
+            self.window.after(100, self._poll_worker_queue)
+    
     def harmanla(self):
-        """Harmanlama işlemini başlat"""
+        """Harmanlama işlemini başlat (arka planda çalışır)"""
+        if self._worker_thread and self._worker_thread.is_alive():
+            show_message(self.window, "Harmanlama zaten devam ediyor!", "warning")
+            return
+            
         if not self.secili_sinav_ids:
             show_message(self.window, "Önce en az bir sınav seçmelisiniz!", "warning")
             return
@@ -964,101 +1001,153 @@ class GelismisHarmanlamaView:
             self.log(f"❌ {msg}")
             return
         
+        # Loading dialog göster
+        self._loading_dialog = LoadingDialog(self.window, "🔄 Harmanlama yapılıyor...")
+        
+        # Arka plan thread'i için veri hazırla
+        worker_data = {
+            'tum_ogrenciler': tum_ogrenciler,
+            'secili_salonlar': secili_salonlar,
+            'sabit_ogrenciler': sabit_ogrenciler,
+            'havuz': havuz,
+            'secili_sinav_snapshot': dict(self.secili_sinav_snapshot)
+        }
+        
+        self.log("⚙️ Harmanlama modu çalıştırılıyor.")
+        self.log("🚀 Harmanlama algoritması arka planda çalışıyor...")
+        
+        # Thread başlat
+        self._worker_thread = threading.Thread(
+            target=self._worker_harmanla,
+            args=(worker_data,),
+            daemon=True
+        )
+        self._worker_thread.start()
+    
+    def _worker_harmanla(self, data: dict):
+        """Arka planda çalışan harmanlama işlemi."""
         try:
             config = HarmanlamaConfig()
-            self.engine = HarmanlamaEngine(config)
+            engine = HarmanlamaEngine(config)
             
-            self.log("⚙️ Harmanlama modu çalıştırılıyor.")
-            self.log("🚀 Harmanlama algoritması çalışıyor...")
+            self._worker_queue.put(("progress", "🔄 Salon sıra haritası hazırlanıyor..."))
             
-            # Loading dialog göster
-            loading = LoadingDialog(self.window, "🔄 Harmanlama yapılıyor...")
-            self.window.update()
+            # DB işlemleri - yeni bağlantı kullan
+            db = get_db()
+            salon_sira_map = db.salon_sira_haritasi([s['id'] for s in data['secili_salonlar']])
             
-            try:
-                salon_sira_map = self.db.salon_sira_haritasi([s['id'] for s in secili_salonlar])
-                sonuc = self.engine.harmanla(
-                    tum_ogrenciler,
-                    secili_salonlar,
-                    sabit_ogrenciler=sabit_ogrenciler,
-                    salon_sira_haritasi=salon_sira_map
-                )
-            finally:
-                loading.stop()
+            self._worker_queue.put(("progress", "🔄 Öğrenciler yerleştiriliyor..."))
             
-            if not sonuc['basarili']:
-                self.log("❌ HARMANLAMA BAŞARISIZ!")
-                for hata in sonuc['hatalar']:
-                    self.log(f"   {hata}")
-                show_message(self.window, "Harmanlama başarısız! Loglara bakın.", "error")
-                return
+            sonuc = engine.harmanla(
+                data['tum_ogrenciler'],
+                data['secili_salonlar'],
+                sabit_ogrenciler=data['sabit_ogrenciler'],
+                salon_sira_haritasi=salon_sira_map
+            )
             
-            self.yerlesim_sonuc = sonuc
-            self.yerlesim_sonuc['secili_sinavlar'] = list(self.secili_sinav_snapshot.values())
-            self.yerlesim_sonuc['havuz_istatistikler'] = havuz['istatistikler']
-            self.yerlesim_sonuc['uyumsuzluklar'] = sonuc.get('uyumsuzluklar', [])
-            self.yerlesim_sonuc['uyumsuzluk_var'] = sonuc.get('uyumsuzluk_var', False)
-            self.son_harman_secili_sinavlar = list(self.secili_sinav_snapshot.values())
+            # Sonucu ana thread'e gönder
+            self._worker_queue.put(("done", {
+                'sonuc': sonuc,
+                'havuz': data['havuz'],
+                'secili_sinav_snapshot': data['secili_sinav_snapshot']
+            }))
             
-            try:
-                self._persist_yerlesim(sonuc['yerlesim'])
-                self.log("💾 Yerleşim veritabanına kaydedildi")
-            except Exception as e:
-                self.log(f"❌ Yerleşim kaydedilemedi: {e}")
-                show_message(self.window,
-                             f"Yerleşim kaydedilirken hata oluştu:\n{e}",
-                             "warning")
-            
-            self.display_results(sonuc)
-            
-            uyumsuzluklar = sonuc.get('uyumsuzluklar') or []
-            if uyumsuzluklar:
-                self.log("⚠️ Uyumsuzluklar tespit edildi:")
-                for detay in uyumsuzluklar:
-                    self.log(f"   {detay}")
-            
-            koltuk_listesi = sonuc.get('koltuk_listesi') or []
-            if koltuk_listesi:
-                self.log("🪑 Koltuk Sıralaması:")
-                max_satir = min(20, len(koltuk_listesi))
-                for satir in koltuk_listesi[:max_satir]:
-                    self.log(f"   {satir}")
-                if len(koltuk_listesi) > max_satir:
-                    self.log(f"   ... toplam {len(koltuk_listesi)} öğrenci")
-            
-            istatistikler = sonuc['istatistikler']
-            self.log("=" * 50)
-            self.log("✅ HARMANLAMA BAŞARILI!")
-            self.log("=" * 50)
-            self.log(f"📊 İstatistikler:")
-            self.log(f"   • Yerleştirilen öğrenci: {istatistikler['yerlestirilen']}")
-            self.log(f"   • Kullanılan salon: {istatistikler['kullanilan_salon']}/{istatistikler['toplam_salon']}")
-            
-            for salon_stat in istatistikler['salon_istatistikleri']:
-                self.log(f"   • {salon_stat['salon_adi']}: {salon_stat['doluluk']}/"
-                         f"{salon_stat['kapasite']} (%{salon_stat['oran']})")
-            
-            stat_text = (f"✅ {istatistikler['yerlestirilen']} öğrenci yerleştirildi | "
-                         f"{istatistikler['kullanilan_salon']} salon kullanıldı")
-            if uyumsuzluklar:
-                stat_text += f" | ⚠️ {len(uyumsuzluklar)} uyumsuzluk"
-            self.log(stat_text)
-            
-            if uyumsuzluklar:
-                warning_text = (
-                    f"Harmanlama tamamlandı ancak {len(uyumsuzluklar)} uyumsuzluk bulundu.\n"
-                    "Detaylar için log ekranını inceleyin."
-                )
-                show_message(self.window, warning_text, "warning")
-            else:
-                show_message(self.window, "✅ Harmanlama başarılı!", "success")
-        
         except Exception as e:
-            error_msg = f"Beklenmeyen hata: {str(e)}"
-            self.log(f"❌ {error_msg}")
-            show_message(self.window, error_msg, "error")
             import traceback
-            traceback.print_exc()
+            self._worker_queue.put(("error", {
+                'message': str(e),
+                'traceback': traceback.format_exc()
+            }))
+    
+    def _on_harmanla_done(self, payload: dict):
+        """Harmanlama tamamlandığında çağrılır (ana thread)."""
+        # Loading dialog kapat
+        if self._loading_dialog:
+            self._loading_dialog.stop()
+            self._loading_dialog = None
+        
+        sonuc = payload['sonuc']
+        havuz = payload['havuz']
+        secili_sinav_snapshot = payload['secili_sinav_snapshot']
+        
+        if not sonuc['basarili']:
+            self.log("❌ HARMANLAMA BAŞARISIZ!")
+            for hata in sonuc['hatalar']:
+                self.log(f"   {hata}")
+            show_message(self.window, "Harmanlama başarısız! Loglara bakın.", "error")
+            return
+        
+        self.yerlesim_sonuc = sonuc
+        self.yerlesim_sonuc['secili_sinavlar'] = list(secili_sinav_snapshot.values())
+        self.yerlesim_sonuc['havuz_istatistikler'] = havuz['istatistikler']
+        self.yerlesim_sonuc['uyumsuzluklar'] = sonuc.get('uyumsuzluklar', [])
+        self.yerlesim_sonuc['uyumsuzluk_var'] = sonuc.get('uyumsuzluk_var', False)
+        self.son_harman_secili_sinavlar = list(secili_sinav_snapshot.values())
+        
+        try:
+            self._persist_yerlesim(sonuc['yerlesim'])
+            self.log("💾 Yerleşim veritabanına kaydedildi")
+        except Exception as e:
+            self.log(f"❌ Yerleşim kaydedilemedi: {e}")
+            show_message(self.window,
+                         f"Yerleşim kaydedilirken hata oluştu:\n{e}",
+                         "warning")
+        
+        self.display_results(sonuc)
+        
+        uyumsuzluklar = sonuc.get('uyumsuzluklar') or []
+        if uyumsuzluklar:
+            self.log("⚠️ Uyumsuzluklar tespit edildi:")
+            for detay in uyumsuzluklar:
+                self.log(f"   {detay}")
+        
+        koltuk_listesi = sonuc.get('koltuk_listesi') or []
+        if koltuk_listesi:
+            self.log("🪑 Koltuk Sıralaması:")
+            max_satir = min(20, len(koltuk_listesi))
+            for satir in koltuk_listesi[:max_satir]:
+                self.log(f"   {satir}")
+            if len(koltuk_listesi) > max_satir:
+                self.log(f"   ... toplam {len(koltuk_listesi)} öğrenci")
+        
+        istatistikler = sonuc['istatistikler']
+        self.log("=" * 50)
+        self.log("✅ HARMANLAMA BAŞARILI!")
+        self.log("=" * 50)
+        self.log(f"📊 İstatistikler:")
+        self.log(f"   • Yerleştirilen öğrenci: {istatistikler['yerlestirilen']}")
+        self.log(f"   • Kullanılan salon: {istatistikler['kullanilan_salon']}/{istatistikler['toplam_salon']}")
+        
+        for salon_stat in istatistikler['salon_istatistikleri']:
+            self.log(f"   • {salon_stat['salon_adi']}: {salon_stat['doluluk']}/"
+                     f"{salon_stat['kapasite']} (%{salon_stat['oran']})")
+        
+        stat_text = (f"✅ {istatistikler['yerlestirilen']} öğrenci yerleştirildi | "
+                     f"{istatistikler['kullanilan_salon']} salon kullanıldı")
+        if uyumsuzluklar:
+            stat_text += f" | ⚠️ {len(uyumsuzluklar)} uyumsuzluk"
+        self.log(stat_text)
+        
+        if uyumsuzluklar:
+            warning_text = (
+                f"Harmanlama tamamlandı ancak {len(uyumsuzluklar)} uyumsuzluk bulundu.\n"
+                "Detaylar için log ekranını inceleyin."
+            )
+            show_message(self.window, warning_text, "warning")
+        else:
+            show_message(self.window, "✅ Harmanlama başarılı!", "success")
+    
+    def _on_harmanla_error(self, payload: dict):
+        """Harmanlama hatası olduğunda çağrılır (ana thread)."""
+        # Loading dialog kapat
+        if self._loading_dialog:
+            self._loading_dialog.stop()
+            self._loading_dialog = None
+        
+        error_msg = f"Beklenmeyen hata: {payload['message']}"
+        self.log(f"❌ {error_msg}")
+        self.log(payload.get('traceback', ''))
+        show_message(self.window, error_msg, "error")
     
     def _hazirla_ogrenci_havuzu(self):
         """Seçili sınavlar için öğrenci listesini hazırla"""
@@ -1294,7 +1383,11 @@ class GelismisHarmanlamaView:
         self.update_gozetmen_map()
 
     def excel_export(self):
-        """Excel'e aktar (gözetmen bilgileri dahil)"""
+        """Excel'e aktar (arka planda çalışır)"""
+        if self._worker_thread and self._worker_thread.is_alive():
+            show_message(self.window, "Başka bir işlem devam ediyor!", "warning")
+            return
+            
         if not self.yerlesim_sonuc:
             show_message(self.window, "Önce harmanlama yapmalısınız!", "warning")
             return
@@ -1309,8 +1402,39 @@ class GelismisHarmanlamaView:
         if not file_path:
             return
         
+        # Loading dialog göster
+        self._loading_dialog = LoadingDialog(self.window, "📊 Excel dosyası hazırlanıyor...")
+        
+        # Veriyi hazırla (ana thread'de - UI erişimi gerekli)
+        snapshot = getattr(self, "son_harman_secili_sinavlar", [])
+        self.update_gozetmen_map()
+        
+        worker_data = {
+            'file_path': file_path,
+            'snapshot': snapshot,
+            'yerlesim': self.yerlesim_sonuc['yerlesim'],
+            'gozetmen_atamalari': list(self.gozetmen_atamalari),
+            'salon_gozetmen_map': dict(self.salon_gozetmen_map),
+            'secili_sinav_id': self.secili_sinav_id
+        }
+        
+        self.log("📊 Excel export başlatılıyor...")
+        
+        # Thread başlat
+        self._worker_thread = threading.Thread(
+            target=self._worker_excel_export,
+            args=(worker_data,),
+            daemon=True
+        )
+        self._worker_thread.start()
+    
+    def _worker_excel_export(self, data: dict):
+        """Arka planda çalışan Excel export işlemi."""
         try:
-            snapshot = getattr(self, "son_harman_secili_sinavlar", [])
+            snapshot = data['snapshot']
+            file_path = data['file_path']
+            
+            # Sınav bilgisi hazırla
             if len(snapshot) == 1:
                 sinav = snapshot[0]
                 sinav_bilgi = {
@@ -1329,7 +1453,8 @@ class GelismisHarmanlamaView:
                     'kacinci_ders': "Karma Program"
                 }
             else:
-                sinav = self.db.sinav_getir(self.secili_sinav_id) if self.secili_sinav_id else None
+                db = get_db()
+                sinav = db.sinav_getir(data['secili_sinav_id']) if data['secili_sinav_id'] else None
                 sinav_bilgi = {
                     'ders_adi': sinav['ders_adi'] if sinav else "Sınav",
                     'tarih': sinav.get('sinav_tarihi') or '-' if sinav else "-",
@@ -1337,16 +1462,16 @@ class GelismisHarmanlamaView:
                     'kacinci_ders': sinav.get('kacinci_ders') or '-' if sinav else "-"
                 }
             
-            # Gözetmen atamalarını güncelle
-            self.update_gozetmen_map()
-            gozetmen_atamalari = self.gozetmen_atamalari
-            salon_gozetmenleri = self.salon_gozetmen_map
+            self._worker_queue.put(("progress", "📊 Öğrenci verileri hazırlanıyor..."))
             
-            # Yerleşim verilerini hazırla (gözetmen bilgileri dahil)
+            # Yerleşim verilerini hazırla
             yerlesim_data = []
             sinav_map = {s['id']: s for s in snapshot} if snapshot else {}
-            for yer in self.yerlesim_sonuc['yerlesim']:
-                ogrenci = self.db.ogrenci_getir(yer['ogrenci_id'])
+            salon_gozetmenleri = data['salon_gozetmen_map']
+            
+            db = get_db()
+            for yer in data['yerlesim']:
+                ogrenci = db.ogrenci_getir(yer['ogrenci_id'])
                 if ogrenci:
                     yerlesim_data.append({
                         'salon_adi': yer['salon_adi'],
@@ -1359,27 +1484,55 @@ class GelismisHarmanlamaView:
                         'sinav_adi': sinav_map.get(yer.get('sinav_id'), {}).get('sinav_adi', yer.get('sinav_adi', ""))
                     })
             
+            self._worker_queue.put(("progress", "📊 Excel dosyası yazılıyor..."))
+            
             # Excel'e yazdır
-            if self.excel_handler.yerlesim_yazdir(file_path, sinav_bilgi, yerlesim_data):
-                self.log(f"✅ Excel dosyası oluşturuldu: {file_path}")
-                
-                # Gözetmen bilgilerini logla
-                if gozetmen_atamalari:
-                    self.log("👨‍🏫 Gözetmen atamaları:")
-                    for atama in gozetmen_atamalari:
-                        gorev_text = "Asıl" if atama['gorev_turu'] == 'asil' else "Yedek"
-                        self.log(f"   • {atama['salon_adi']}: {atama['ad']} {atama['soyad']} ({gorev_text})")
-                
-                show_message(self.window, f"✅ Excel dosyası oluşturuldu:\n{file_path}\n\n📋 Gözetmen atamaları da dahil edildi!", "success")
-            else:
-                self.log("❌ Excel dosyası oluşturulamadı")
-                show_message(self.window, "Excel dosyası oluşturulamadı!\nDosya başka bir uygulamada açık olabilir.", "error")
+            excel_handler = ExcelHandler()
+            success = excel_handler.yerlesim_yazdir(file_path, sinav_bilgi, yerlesim_data)
+            
+            self._worker_queue.put(("excel_done", {
+                'success': success,
+                'file_path': file_path,
+                'gozetmen_atamalari': data['gozetmen_atamalari']
+            }))
+            
         except Exception as e:
-            error_msg = f"Excel export hatası: {e}"
-            self.log(f"❌ {error_msg}")
-            show_message(self.window, error_msg, "error")
             import traceback
-            traceback.print_exc()
+            self._worker_queue.put(("excel_error", {
+                'message': str(e),
+                'traceback': traceback.format_exc()
+            }))
+    
+    def _on_excel_done(self, payload: dict):
+        """Excel export tamamlandığında çağrılır (ana thread)."""
+        if self._loading_dialog:
+            self._loading_dialog.stop()
+            self._loading_dialog = None
+        
+        if payload['success']:
+            self.log(f"✅ Excel dosyası oluşturuldu: {payload['file_path']}")
+            
+            if payload['gozetmen_atamalari']:
+                self.log("👨‍🏫 Gözetmen atamaları:")
+                for atama in payload['gozetmen_atamalari']:
+                    gorev_text = "Asıl" if atama['gorev_turu'] == 'asil' else "Yedek"
+                    self.log(f"   • {atama['salon_adi']}: {atama['ad']} {atama['soyad']} ({gorev_text})")
+            
+            show_message(self.window, f"✅ Excel dosyası oluşturuldu:\n{payload['file_path']}\n\n📋 Gözetmen atamaları da dahil edildi!", "success")
+        else:
+            self.log("❌ Excel dosyası oluşturulamadı")
+            show_message(self.window, "Excel dosyası oluşturulamadı!\nDosya başka bir uygulamada açık olabilir.", "error")
+    
+    def _on_excel_error(self, payload: dict):
+        """Excel export hatası olduğunda çağrılır (ana thread)."""
+        if self._loading_dialog:
+            self._loading_dialog.stop()
+            self._loading_dialog = None
+        
+        error_msg = f"Excel export hatası: {payload['message']}"
+        self.log(f"❌ {error_msg}")
+        self.log(payload.get('traceback', ''))
+        show_message(self.window, error_msg, "error")
 
 
     def _ensure_yerlesim_data(self):
